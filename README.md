@@ -33,12 +33,13 @@ pip install boto3
 ## Usage
 
 ```bash
-python anyanykiller.py --sg-id sg-12345678 --hours 24 --verbose
+python anyanykiller.py --sg-id sg-12345678 --eni-id eni-12345678 --hours 24 --verbose
 ```
 
 ### Parameters
 
 - `--sg-id`: Security Group ID to analyze
+- `--eni-id`: Network Interface ID to analyze
 - `--hours`: Time period to analyze (default: 24, supports float values for sub-hour periods)
 - `--verbose`: Enable detailed output
 - `--max-flows`: Maximum number of flow log entries to retrieve (default: 10000)
