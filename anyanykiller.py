@@ -268,8 +268,8 @@ class SecurityGroupAnalyzer:
             rule_protocol = rule.get('IpProtocol', '-1')
             if rule_protocol != '-1':
                 # Convert protocol names to numbers
-                protocol_map = {'tcp': '6', 'udp': '17', 'icmp': '1'}
-                rule_protocol_num = protocol_map.get(rule_protocol.lower(), rule_protocol)
+                protocol_map_to_num = {'tcp': '6', 'udp': '17', 'icmp': '1'}
+                rule_protocol_num = protocol_map_to_num.get(rule_protocol.lower(), rule_protocol)
                 if rule_protocol_num != str(protocol):
                     return False
             
