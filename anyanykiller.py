@@ -1,17 +1,22 @@
 #!/usr/bin/env python3
-from boto3 import client
-from json import loads
-from ipaddress import ip_address, ip_network
+import boto3
+import json
+import ipaddress
 from datetime import datetime, timedelta
-from argparse import ArgumentParser
-from time import sleep
+import argparse
+import time
+from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 class SecurityGroupAnalyzer:
     def __init__(self, verbose=False):
-        self.ec2_client = client('ec2')
-        self.logs_client = client('logs')
+        self.ec2_client = boto3.client('ec2')
+        self.logs_client = boto3.client('logs')
         self.protocol_map = {1: 'ICMP', 6: 'TCP', 17: 'UDP', 47: 'GRE', 50: 'ESP', 51: 'AH'}
         self.verbose = verbose
+        self._ip_network_cache = {}
+        self._well_known_ports = {22, 25, 53, 80, 443, 3306, 3389, 5432, 8080, 8443}
+        self._eni_cache = {}
 
     def get_security_group(self, sg_id):
         """Retrieve security group configuration"""
@@ -94,132 +99,116 @@ class SecurityGroupAnalyzer:
                 
             chunk_size = min(1000, max_flows // max(1, num_chunks))  # Smaller chunk size to avoid hitting limits
             
-            all_flows = []
-            last_progress = -1
-            print("Retrieving flow logs: ", end="", flush=True)
+            # Process chunks in parallel for better performance
+            def process_chunk(chunk_info):
+                i, chunk_start, chunk_end = chunk_info
+                try:
+                    query = f"fields @timestamp, @message | filter @message like / {eni_id} / | sort @timestamp asc"
+                    max_results_per_query = chunk_size * 2
+                    
+                    start_query_response = self.logs_client.start_query(
+                        logGroupName=log_group,
+                        startTime=int(chunk_start.timestamp() * 1000),
+                        endTime=int(chunk_end.timestamp() * 1000),
+                        queryString=query,
+                        limit=max_results_per_query
+                    )
+                    
+                    query_id = start_query_response['queryId']
+                    while True:
+                        response = self.logs_client.get_query_results(queryId=query_id)
+                        if response['status'] == 'Complete':
+                            break
+                        elif response['status'] == 'Failed':
+                            return []
+                        time.sleep(1)
+                    
+                    chunk_flows = []
+                    for result in response['results']:
+                        message = None
+                        timestamp = None
+                        for field in result:
+                            if field['field'] == '@message':
+                                message = field['value']
+                            elif field['field'] == '@timestamp':
+                                timestamp = field['value']
+                        
+                        if message:
+                            parts = message.strip().split(None, 13)
+                            if len(parts) >= 13:
+                                protocol_num = int(parts[7]) if parts[7].isdigit() else 0
+                                flow = {
+                                    '@timestamp': timestamp,
+                                    'version': parts[0],
+                                    'account_id': parts[1],
+                                    'interface_id': parts[2],
+                                    'srcaddr': parts[3],
+                                    'dstaddr': parts[4],
+                                    'srcport': int(parts[5]) if parts[5].isdigit() else 0,
+                                    'dstport': int(parts[6]) if parts[6].isdigit() else 0,
+                                    'protocol': int(parts[7]) if parts[7].isdigit() else 0,
+                                    'protocol_name': self.protocol_map.get(protocol_num, f'Protocol-{protocol_num}'),
+                                    'packets': int(parts[8]) if parts[8].isdigit() else 0,
+                                    'bytes': int(parts[9]) if parts[9].isdigit() else 0,
+                                    'windowstart': parts[10],
+                                    'windowend': parts[11],
+                                    'action': parts[12],
+                                    'flowlogstatus': parts[13] if len(parts) > 13 else 'OK'
+                                }
+                                
+                                if flow['interface_id'] == eni_id:
+                                    chunk_flows.append(flow)
+                    
+                    return chunk_flows
+                except Exception as e:
+                    if self.verbose:
+                        print(f"Error processing chunk {i}: {e}")
+                    return []
+            
+            # Prepare chunk information
+            chunk_infos = []
             for i in range(num_chunks):
-                # Show progress percentage
-                progress = round((i / num_chunks) * 100)
-                
-                # In non-verbose mode, print progress percentage at 10% intervals
-                if not self.verbose and progress % 10 == 0 and progress != last_progress:
-                    print(f"{progress}%", end=" ", flush=True)
-                    last_progress = progress
-                elif self.verbose:
-                    print(f"Progress: {progress}% ({i}/{num_chunks} chunks)")
-                
-                # Calculate chunk boundaries, ensuring they don't overlap
                 chunk_end = end_time - timedelta(hours=i * chunk_hours)
                 chunk_start = chunk_end - timedelta(hours=chunk_hours)
                 
-                # Ensure chunk_start is not before the overall start_time
                 if chunk_start < start_time:
                     chunk_start = start_time
-                    
-                # Ensure chunk_start is at least 1 second before chunk_end to avoid API errors
                 if chunk_start >= chunk_end:
                     chunk_start = chunk_end - timedelta(seconds=1)
                 
-                if self.verbose:
-                    print(f"Querying chunk {i+1}/{num_chunks}: {chunk_start} to {chunk_end}...")
+                chunk_infos.append((i, chunk_start, chunk_end))
+            
+            all_flows = []
+            print("Retrieving flow logs: ", end="", flush=True)
+            
+            # Use parallel processing for chunks
+            with ThreadPoolExecutor(max_workers=min(4, num_chunks)) as executor:
+                future_to_chunk = {executor.submit(process_chunk, chunk_info): chunk_info for chunk_info in chunk_infos}
                 
-                # Use a more targeted query with a limit for each chunk
-                # Sort by timestamp ascending to ensure we get oldest logs first in each chunk
-                # VPC Flow Logs format: version account-id interface-id srcaddr dstaddr srcport dstport...
-                # Use a more precise filter with word boundaries to match the exact ENI ID
-                query = f"fields @timestamp, @message | filter @message like / {eni_id} / | sort @timestamp asc"
-                
-                # Check if we're getting exactly the same number of results in each chunk
-                # If so, we might be hitting CloudWatch Logs query limits
-                max_results_per_query = chunk_size * 2  # Double the chunk size to check for limits
-                
-                start_query_response = self.logs_client.start_query(
-                    logGroupName=log_group,
-                    startTime=int(chunk_start.timestamp() * 1000),
-                    endTime=int(chunk_end.timestamp() * 1000),
-                    queryString=query,
-                    limit=max_results_per_query
-                )
-                
-                # Wait for query completion
-                query_id = start_query_response['queryId']
-                if self.verbose:
-                    print(f"Waiting for chunk {i+1} query to complete...")
-                while True:
-                    response = self.logs_client.get_query_results(queryId=query_id)
-                    if response['status'] == 'Complete':
+                completed = 0
+                for future in as_completed(future_to_chunk):
+                    chunk_flows = future.result()
+                    all_flows.extend(chunk_flows)
+                    
+                    completed += 1
+                    progress = round((completed / num_chunks) * 100)
+                    if not self.verbose and progress % 25 == 0:
+                        print(f"{progress}%", end=" ", flush=True)
+                    elif self.verbose:
+                        chunk_info = future_to_chunk[future]
+                        print(f"Completed chunk {chunk_info[0]+1}/{num_chunks}: {len(chunk_flows)} flows")
+                    
+                    # Early termination if we have enough flows
+                    if len(all_flows) >= max_flows * 2:
                         if self.verbose:
-                            print(f"Chunk {i+1} query complete.")
+                            print(f"Reached flow limit, cancelling remaining chunks")
+                        # Cancel remaining futures
+                        for f in future_to_chunk:
+                            if not f.done():
+                                f.cancel()
                         break
-                    elif response['status'] == 'Failed':
-                        print(f"Chunk {i+1} query failed.")
-                        break
-                    sleep(1)
-                    
-                # Check if we might be hitting CloudWatch Logs query limits
-                if len(response['results']) == 416:  # If we see the same number consistently
-                    if self.verbose:
-                        print(f"Note: Retrieved exactly 416 results, which may indicate a CloudWatch Logs limit")
-                    
-                # If we got exactly the same number of results as the chunk size,
-                # we might be hitting a limit, so log a warning
-                
-                # Parse raw flow log messages
-                chunk_flows = []
-                for result in response['results']:
-                    message = None
-                    timestamp = None
-                    for field in result:
-                        if field['field'] == '@message':
-                            message = field['value']
-                        elif field['field'] == '@timestamp':
-                            timestamp = field['value']
-                    
-                    if message:
-                        # Parse flow log format: version account-id interface-id srcaddr dstaddr srcport dstport protocol packets bytes windowstart windowend action flowlogstatus
-                        parts = message.strip().split()
-                        if len(parts) >= 13:
-                            protocol_num = int(parts[7]) if parts[7].isdigit() else 0
-                            flow = {
-                                '@timestamp': timestamp,
-                                'version': parts[0],
-                                'account_id': parts[1],
-                                'interface_id': parts[2],
-                                'srcaddr': parts[3],
-                                'dstaddr': parts[4],
-                                'srcport': int(parts[5]) if parts[5].isdigit() else 0,
-                                'dstport': int(parts[6]) if parts[6].isdigit() else 0,
-                                'protocol': int(parts[7]) if parts[7].isdigit() else 0,
-                                'protocol_name': self.protocol_map.get(protocol_num, f'Protocol-{protocol_num}'),
-                                'packets': int(parts[8]) if parts[8].isdigit() else 0,
-                                'bytes': int(parts[9]) if parts[9].isdigit() else 0,
-                                'windowstart': parts[10],
-                                'windowend': parts[11],
-                                'action': parts[12],
-                                'flowlogstatus': parts[13] if len(parts) > 13 else 'OK'
-                            }
-                            
-                            # We're already filtering by ENI in the query, but double-check
-                            # to ensure we only process relevant flows
-                            if flow['interface_id'] == eni_id:
-                                chunk_flows.append(flow)
-                
-                if self.verbose:
-                    print(f"Retrieved {len(chunk_flows)} flows from chunk {i+1} ({chunk_start} to {chunk_end})")
-                all_flows.extend(chunk_flows)
-                
-                # Add a small delay between chunks to avoid API rate limiting
-                if i < num_chunks - 1:
-                    sleep(0.2)
-                
-                # Continue querying even if we've collected enough flows to ensure we cover the entire time range
-                # But implement a hard cap to prevent excessive resource usage
-                if len(all_flows) >= max_flows * 2:
-                    if self.verbose:
-                        print(f"Reached hard cap of {max_flows * 2} flows. Stopping queries.")
-                    else:
-                        print("(reached flow limit)")
-                    break
+            
+
             
             # Complete the progress indicator with a newline
             if not self.verbose:
@@ -263,17 +252,27 @@ class SecurityGroupAnalyzer:
         to_port = rule.get('ToPort', 65535)
         return from_port <= port <= to_port
     
+    def _get_cached_network(self, cidr):
+        """Get cached IP network object"""
+        if cidr not in self._ip_network_cache:
+            self._ip_network_cache[cidr] = ipaddress.ip_network(cidr)
+        return self._ip_network_cache[cidr]
+    
     def _check_ip_ranges(self, ip_addr, rule):
         """Check if IP address is allowed by rule's IP ranges"""
-        for ip_range in rule.get('IpRanges', []):
-            cidr = ip_range.get('CidrIp')
-            if cidr and ip_address(ip_addr) in ip_network(cidr):
-                return True
-        
-        for ipv6_range in rule.get('Ipv6Ranges', []):
-            cidr = ipv6_range.get('CidrIpv6')
-            if cidr and ip_address(ip_addr) in ip_network(cidr):
-                return True
+        try:
+            ip_obj = ipaddress.ip_address(ip_addr)
+            for ip_range in rule.get('IpRanges', []):
+                cidr = ip_range.get('CidrIp')
+                if cidr and ip_obj in self._get_cached_network(cidr):
+                    return True
+            
+            for ipv6_range in rule.get('Ipv6Ranges', []):
+                cidr = ipv6_range.get('CidrIpv6')
+                if cidr and ip_obj in self._get_cached_network(cidr):
+                    return True
+        except ValueError:
+            return False
         
         return False
     
@@ -331,11 +330,8 @@ class SecurityGroupAnalyzer:
             if dst_port > 10000:
                 return True
                 
-            # Common well-known ports that are typically server ports, not client return traffic
-            well_known_server_ports = {22, 25, 53, 80, 443, 3306, 3389, 5432, 8080, 8443}
-            
             # If destination is a well-known server port, this is likely client->server traffic, not return traffic
-            if dst_port in well_known_server_ports:
+            if dst_port in self._well_known_ports:
                 return False
             
             # Use index for faster lookup if provided
@@ -358,7 +354,7 @@ class SecurityGroupAnalyzer:
             # If no matching outbound flow found and not a common server port,
             # assume high source ports (>1024) connecting to non-standard destination ports
             # are likely return traffic
-            if src_port > 1024 and dst_port > 1024 and dst_port not in well_known_server_ports:
+            if src_port > 1024 and dst_port > 1024 and dst_port not in self._well_known_ports:
                 return True
                 
             return False
@@ -404,9 +400,9 @@ class SecurityGroupAnalyzer:
                             # Handle different timestamp formats
                             ts = flow.get('@timestamp', '')
                             if '.' in ts:  # Format with microseconds
-                                dt = datetime.fromisoformat(ts.replace(' ', 'T'))
+                                dt = datetime.strptime(ts, '%Y-%m-%d %H:%M:%S.%f')
                             else:  # Format without microseconds
-                                dt = datetime.fromisoformat(ts.replace(' ', 'T'))
+                                dt = datetime.strptime(ts, '%Y-%m-%d %H:%M:%S')
                             timestamps.append(dt)
                         except ValueError:
                             # Skip invalid timestamps
@@ -433,9 +429,11 @@ class SecurityGroupAnalyzer:
     
         print(f"Retrieved {len(flows)} flow log entries")
             
-        # Get ENI IP address for return traffic detection
-        eni_response = self.ec2_client.describe_network_interfaces(NetworkInterfaceIds=[eni_id])
-        eni_ip = eni_response['NetworkInterfaces'][0]['PrivateIpAddress']
+        # Get ENI IP address for return traffic detection (with caching)
+        if eni_id not in self._eni_cache:
+            eni_response = self.ec2_client.describe_network_interfaces(NetworkInterfaceIds=[eni_id])
+            self._eni_cache[eni_id] = eni_response['NetworkInterfaces'][0]['PrivateIpAddress']
+        eni_ip = self._eni_cache[eni_id]
         
         # Identify any:any rules using list comprehensions
         inbound_rules = sg.get('IpPermissions', [])
@@ -454,17 +452,25 @@ class SecurityGroupAnalyzer:
         # Build outbound flow index for faster return traffic detection
         outbound_index = self._build_flow_index(flows, eni_ip)
         
-        # Analyze traffic that would be affected
+        # Analyze traffic that would be affected with early termination
         affected_flows = []
         still_allowed_flows = []
         inbound_flows = 0
         return_traffic_flows = 0
+        processed_flows = 0
         
         for flow in flows:
             if flow['action'] != 'ACCEPT' or flow['dstaddr'] != eni_ip:
                 continue
             
             inbound_flows += 1
+            processed_flows += 1
+            
+            # Early termination if we have enough data
+            if processed_flows > max_flows:
+                if self.verbose:
+                    print(f"Early termination: processed {processed_flows} flows")
+                break
             
             # Skip return traffic as it's automatically allowed by stateful security groups
             if self.is_return_traffic(flow, flows, eni_ip, outbound_index):
@@ -492,11 +498,11 @@ class SecurityGroupAnalyzer:
             # Filter out any remaining high port traffic that might have been missed
             filtered_affected = [flow for flow in affected_flows if int(flow['dstport']) <= 10000]
             
-            # Count flows per unique combination
-            flow_counts = {}
+            # Count flows per unique combination using defaultdict
+            flow_counts = defaultdict(int)
             for flow in filtered_affected:
                 flow_key = (flow['srcaddr'], flow['protocol_name'], flow['dstport'])
-                flow_counts[flow_key] = flow_counts.get(flow_key, 0) + 1
+                flow_counts[flow_key] += 1
             
             # Create list of unique flows with counts
             unique_affected = []
@@ -528,11 +534,11 @@ class SecurityGroupAnalyzer:
 
         
         if still_allowed_flows:
-            # Count flows per unique combination for still allowed flows
-            allowed_flow_counts = {}
+            # Count flows per unique combination for still allowed flows using defaultdict
+            allowed_flow_counts = defaultdict(int)
             for flow in still_allowed_flows:
                 flow_key = (flow['srcaddr'], flow['protocol_name'], flow['dstport'])
-                allowed_flow_counts[flow_key] = allowed_flow_counts.get(flow_key, 0) + 1
+                allowed_flow_counts[flow_key] += 1
             
             # Create list of unique allowed flows with counts
             unique_allowed = []
@@ -561,7 +567,7 @@ class SecurityGroupAnalyzer:
             print("Consider adding specific inbound rules for the affected traffic first")
 
 def main():
-    parser = ArgumentParser(description='Analyze Security Group any:any rules')
+    parser = argparse.ArgumentParser(description='Analyze Security Group any:any rules')
     parser.add_argument('--sg-id', required=True, help='Security Group ID')
     parser.add_argument('--eni-id', required=True, help='Network Interface ID')
     parser.add_argument('--hours', type=float, default=24, help='Hours of flow logs to analyze (default: 24, can be decimal like 0.5 for 30 minutes)')
