@@ -495,8 +495,8 @@ class SecurityGroupAnalyzer:
         print(f"Note: Traffic to high ports (>10000) is automatically classified as return traffic")
         
         if affected_flows:
-            # Filter out any remaining high port traffic that might have been missed
-            filtered_affected = [flow for flow in affected_flows if int(flow['dstport']) <= 10000]
+            # Filter out any remaining high port traffic that might have been missed, but keep ICMP
+            filtered_affected = [flow for flow in affected_flows if flow['protocol'] == 1 or int(flow['dstport']) <= 10000]
             
             # Count flows per unique combination using defaultdict
             flow_counts = defaultdict(int)
