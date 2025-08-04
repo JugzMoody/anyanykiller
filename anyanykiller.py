@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
-import boto3
-import json
-import ipaddress
+from boto3 import client
+from json import loads
+from ipaddress import ip_address, ip_network
 from datetime import datetime, timedelta
-import argparse
+from argparse import ArgumentParser
+from time import sleep
 
 class SecurityGroupAnalyzer:
     def __init__(self, verbose=False):
-        self.ec2_client = boto3.client('ec2')
-        self.logs_client = boto3.client('logs')
+        self.ec2_client = client('ec2')
+        self.logs_client = client('logs')
         self.protocol_map = {1: 'ICMP', 6: 'TCP', 17: 'UDP', 47: 'GRE', 50: 'ESP', 51: 'AH'}
         self.verbose = verbose
 
@@ -17,7 +18,7 @@ class SecurityGroupAnalyzer:
         try:
             response = self.ec2_client.describe_security_groups(GroupIds=[sg_id])
             return response['SecurityGroups'][0]
-        except Exception as e:
+        except (self.ec2_client.exceptions.ClientError, Exception) as e:
             print(f"Error retrieving security group {sg_id}: {str(e)}")
             return None
 
@@ -153,8 +154,7 @@ class SecurityGroupAnalyzer:
                     elif response['status'] == 'Failed':
                         print(f"Chunk {i+1} query failed.")
                         break
-                    import time
-                    time.sleep(1)
+                    sleep(1)
                     
                 # Check if we might be hitting CloudWatch Logs query limits
                 if len(response['results']) == 416:  # If we see the same number consistently
@@ -187,12 +187,12 @@ class SecurityGroupAnalyzer:
                                 'interface_id': parts[2],
                                 'srcaddr': parts[3],
                                 'dstaddr': parts[4],
-                                'srcport': parts[5],
-                                'dstport': parts[6],
-                                'protocol': parts[7],
+                                'srcport': int(parts[5]) if parts[5].isdigit() else 0,
+                                'dstport': int(parts[6]) if parts[6].isdigit() else 0,
+                                'protocol': int(parts[7]) if parts[7].isdigit() else 0,
                                 'protocol_name': self.protocol_map.get(protocol_num, f'Protocol-{protocol_num}'),
-                                'packets': parts[8],
-                                'bytes': parts[9],
+                                'packets': int(parts[8]) if parts[8].isdigit() else 0,
+                                'bytes': int(parts[9]) if parts[9].isdigit() else 0,
                                 'windowstart': parts[10],
                                 'windowend': parts[11],
                                 'action': parts[12],
@@ -210,7 +210,7 @@ class SecurityGroupAnalyzer:
                 
                 # Add a small delay between chunks to avoid API rate limiting
                 if i < num_chunks - 1:
-                    time.sleep(0.2)
+                    sleep(0.2)
                 
                 # Continue querying even if we've collected enough flows to ensure we cover the entire time range
                 # But implement a hard cap to prevent excessive resource usage
@@ -226,7 +226,7 @@ class SecurityGroupAnalyzer:
                 print("100% Complete")
             
             return all_flows
-        except Exception as e:
+        except (self.ec2_client.exceptions.ClientError, self.logs_client.exceptions.ClientError, Exception) as e:
             print(f"Error retrieving flow logs: {str(e)}")
             return []
 
@@ -247,71 +247,87 @@ class SecurityGroupAnalyzer:
         
         return False
 
+    def _check_protocol(self, flow_protocol, rule_protocol):
+        """Check if flow protocol matches rule protocol"""
+        if rule_protocol == '-1':
+            return True
+        protocol_map_to_num = {'tcp': 6, 'udp': 17, 'icmp': 1}
+        rule_protocol_num = protocol_map_to_num.get(rule_protocol.lower(), int(rule_protocol) if rule_protocol.isdigit() else -1)
+        return rule_protocol_num == flow_protocol
+    
+    def _check_port_range(self, port, rule, protocol):
+        """Check if port is within rule's port range"""
+        if protocol == 1:  # ICMP doesn't use ports
+            return True
+        from_port = rule.get('FromPort', 0)
+        to_port = rule.get('ToPort', 65535)
+        return from_port <= port <= to_port
+    
+    def _check_ip_ranges(self, ip_addr, rule):
+        """Check if IP address is allowed by rule's IP ranges"""
+        for ip_range in rule.get('IpRanges', []):
+            cidr = ip_range.get('CidrIp')
+            if cidr and ip_address(ip_addr) in ip_network(cidr):
+                return True
+        
+        for ipv6_range in rule.get('Ipv6Ranges', []):
+            cidr = ipv6_range.get('CidrIpv6')
+            if cidr and ip_address(ip_addr) in ip_network(cidr):
+                return True
+        
+        return False
+    
     def traffic_allowed_by_rule(self, flow, rule, is_inbound=True):
         """Check if traffic flow is allowed by a specific security group rule"""
         try:
-            protocol = int(flow['protocol'])
+            protocol = flow['protocol']
             src_ip = flow['srcaddr']
             dst_ip = flow['dstaddr']
-            src_port = int(flow['srcport'])
-            dst_port = int(flow['dstport'])
+            src_port = flow['srcport']
+            dst_port = flow['dstport']
             
             # Determine relevant IP and port based on direction
-            if is_inbound:
-                relevant_ip = src_ip
-                relevant_port = dst_port
-            else:
-                relevant_ip = dst_ip
-                relevant_port = src_port
+            relevant_ip = src_ip if is_inbound else dst_ip
+            relevant_port = dst_port if is_inbound else src_port
             
-            # Check protocol - convert protocol names to numbers
-            rule_protocol = rule.get('IpProtocol', '-1')
-            if rule_protocol != '-1':
-                # Convert protocol names to numbers
-                protocol_map_to_num = {'tcp': '6', 'udp': '17', 'icmp': '1'}
-                rule_protocol_num = protocol_map_to_num.get(rule_protocol.lower(), rule_protocol)
-                if rule_protocol_num != str(protocol):
-                    return False
+            # Check protocol
+            if not self._check_protocol(protocol, rule.get('IpProtocol', '-1')):
+                return False
             
-            # Check port range (skip for ICMP and other protocols that don't use ports)
-            if protocol not in [1]:  # ICMP doesn't use ports
-                from_port = rule.get('FromPort', 0)
-                to_port = rule.get('ToPort', 65535)
-                if not (from_port <= relevant_port <= to_port):
-                    return False
+            # Check port range
+            if not self._check_port_range(relevant_port, rule, protocol):
+                return False
             
             # Check IP ranges
-            ip_allowed = False
-            for ip_range in rule.get('IpRanges', []):
-                cidr = ip_range.get('CidrIp')
-                if cidr and ipaddress.ip_address(relevant_ip) in ipaddress.ip_network(cidr):
-                    ip_allowed = True
-                    break
-            
-            if not ip_allowed:
-                for ipv6_range in rule.get('Ipv6Ranges', []):
-                    cidr = ipv6_range.get('CidrIpv6')
-                    if cidr and ipaddress.ip_address(relevant_ip) in ipaddress.ip_network(cidr):
-                        ip_allowed = True
-                        break
-            
-            return ip_allowed
-        except Exception:
+            return self._check_ip_ranges(relevant_ip, rule)
+        except (ValueError, TypeError) as e:
+            if self.verbose:
+                print(f"Error checking traffic rule: {str(e)}")
             return False
 
-    def is_return_traffic(self, flow, flows, eni_ip):
+    def _build_flow_index(self, flows, eni_ip):
+        """Build an index of outbound flows for faster lookup"""
+        outbound_flows = {}
+        for flow in flows:
+            if flow['srcaddr'] == eni_ip:
+                key = (flow['dstaddr'], flow['protocol'])
+                if key not in outbound_flows:
+                    outbound_flows[key] = []
+                outbound_flows[key].append(flow)
+        return outbound_flows
+    
+    def is_return_traffic(self, flow, flows, eni_ip, outbound_index=None):
         """Check if this flow is return traffic for an established session"""
         try:
-            protocol = int(flow['protocol'])
-            src_port = int(flow['srcport'])
-            dst_port = int(flow['dstport'])
+            protocol = flow['protocol']
+            src_port = flow['srcport']
+            dst_port = flow['dstport']
             
             # For ICMP, don't treat as return traffic - each ping is a new inbound request
             if protocol == 1:  # ICMP
                 return False
             
             # Assume high destination ports (>10000) are likely return traffic or ephemeral connections
-            # This catches cases where external services connect back on high ports
             if dst_port > 10000:
                 return True
                 
@@ -321,23 +337,23 @@ class SecurityGroupAnalyzer:
             # If destination is a well-known server port, this is likely client->server traffic, not return traffic
             if dst_port in well_known_server_ports:
                 return False
+            
+            # Use index for faster lookup if provided
+            if outbound_index:
+                key = (flow['srcaddr'], protocol)
+                matching_flows = outbound_index.get(key, [])
+            else:
+                matching_flows = [f for f in flows if f['srcaddr'] == eni_ip and f['dstaddr'] == flow['srcaddr'] and f['protocol'] == protocol]
+            
+            # Check for matching outbound flows
+            for other_flow in matching_flows:
+                # Exact port match (typical for established connections)
+                if (other_flow['srcport'] == dst_port and other_flow['dstport'] == src_port):
+                    return True
                 
-            # For all other traffic, check if there's a matching outbound flow
-            # that would indicate this is return traffic
-            for other_flow in flows:
-                # Check for a matching outbound flow (from ENI to the source of this flow)
-                if (other_flow['srcaddr'] == eni_ip and 
-                    other_flow['dstaddr'] == flow['srcaddr'] and
-                    other_flow['protocol'] == flow['protocol']):
-                    
-                    # Exact port match (typical for established connections)
-                    if (other_flow['srcport'] == flow['dstport'] and
-                        other_flow['dstport'] == flow['srcport']):
-                        return True
-                    
-                    # If ENI initiated connection to this IP on any port, consider high port responses as return traffic
-                    if dst_port > 1024:
-                        return True
+                # If ENI initiated connection to this IP on any port, consider high port responses as return traffic
+                if dst_port > 1024:
+                    return True
             
             # If no matching outbound flow found and not a common server port,
             # assume high source ports (>1024) connecting to non-standard destination ports
@@ -346,7 +362,7 @@ class SecurityGroupAnalyzer:
                 return True
                 
             return False
-        except Exception as e:
+        except (ValueError, TypeError) as e:
             if self.verbose:
                 print(f"Error in return traffic detection: {str(e)}")
             return False
@@ -388,9 +404,9 @@ class SecurityGroupAnalyzer:
                             # Handle different timestamp formats
                             ts = flow.get('@timestamp', '')
                             if '.' in ts:  # Format with microseconds
-                                dt = datetime.strptime(ts, '%Y-%m-%d %H:%M:%S.%f')
+                                dt = datetime.fromisoformat(ts.replace(' ', 'T'))
                             else:  # Format without microseconds
-                                dt = datetime.strptime(ts, '%Y-%m-%d %H:%M:%S')
+                                dt = datetime.fromisoformat(ts.replace(' ', 'T'))
                             timestamps.append(dt)
                         except ValueError:
                             # Skip invalid timestamps
@@ -421,68 +437,46 @@ class SecurityGroupAnalyzer:
         eni_response = self.ec2_client.describe_network_interfaces(NetworkInterfaceIds=[eni_id])
         eni_ip = eni_response['NetworkInterfaces'][0]['PrivateIpAddress']
         
-        # Identify any:any rules
-        any_any_inbound = []
-        any_any_outbound = []
-        other_inbound = []
-        other_outbound = []
+        # Identify any:any rules using list comprehensions
+        inbound_rules = sg.get('IpPermissions', [])
+        outbound_rules = sg.get('IpPermissionsEgress', [])
         
-        for rule in sg.get('IpPermissions', []):
-            if self.is_any_any_rule(rule):
-                any_any_inbound.append(rule)
-            else:
-                other_inbound.append(rule)
-
-        
-        for rule in sg.get('IpPermissionsEgress', []):
-            if self.is_any_any_rule(rule):
-                any_any_outbound.append(rule)
-            else:
-                other_outbound.append(rule)
+        any_any_inbound = [rule for rule in inbound_rules if self.is_any_any_rule(rule)]
+        other_inbound = [rule for rule in inbound_rules if not self.is_any_any_rule(rule)]
+        any_any_outbound = [rule for rule in outbound_rules if self.is_any_any_rule(rule)]
+        other_outbound = [rule for rule in outbound_rules if not self.is_any_any_rule(rule)]
         
         if not any_any_inbound:
             print("\nNo inbound any:any rules found in this security group")
             return
 
         
+        # Build outbound flow index for faster return traffic detection
+        outbound_index = self._build_flow_index(flows, eni_ip)
+        
         # Analyze traffic that would be affected
         affected_flows = []
         still_allowed_flows = []
-        total_flows = len(flows)
         inbound_flows = 0
         return_traffic_flows = 0
         
         for flow in flows:
-            if flow['action'] != 'ACCEPT':
-                continue
-            
-            # Only analyze inbound traffic (destination is the ENI)
-            if flow['dstaddr'] != eni_ip:
+            if flow['action'] != 'ACCEPT' or flow['dstaddr'] != eni_ip:
                 continue
             
             inbound_flows += 1
             
             # Skip return traffic as it's automatically allowed by stateful security groups
-            if self.is_return_traffic(flow, flows, eni_ip):
+            if self.is_return_traffic(flow, flows, eni_ip, outbound_index):
                 return_traffic_flows += 1
                 continue
             
             # Check if inbound flow is currently allowed by inbound any:any rule
-            allowed_by_any_any = False
-            for rule in any_any_inbound:
-                if self.traffic_allowed_by_rule(flow, rule, is_inbound=True):
-                    allowed_by_any_any = True
-                    break
-            
-
+            allowed_by_any_any = any(self.traffic_allowed_by_rule(flow, rule, is_inbound=True) for rule in any_any_inbound)
             
             if allowed_by_any_any:
                 # Check if it would still be allowed by other inbound rules
-                allowed_by_other = False
-                for rule in other_inbound:
-                    if self.traffic_allowed_by_rule(flow, rule, is_inbound=True):
-                        allowed_by_other = True
-                        break
+                allowed_by_other = any(self.traffic_allowed_by_rule(flow, rule, is_inbound=True) for rule in other_inbound)
                 
                 if allowed_by_other:
                     still_allowed_flows.append(flow)
@@ -567,7 +561,7 @@ class SecurityGroupAnalyzer:
             print("Consider adding specific inbound rules for the affected traffic first")
 
 def main():
-    parser = argparse.ArgumentParser(description='Analyze Security Group any:any rules')
+    parser = ArgumentParser(description='Analyze Security Group any:any rules')
     parser.add_argument('--sg-id', required=True, help='Security Group ID')
     parser.add_argument('--eni-id', required=True, help='Network Interface ID')
     parser.add_argument('--hours', type=float, default=24, help='Hours of flow logs to analyze (default: 24, can be decimal like 0.5 for 30 minutes)')
