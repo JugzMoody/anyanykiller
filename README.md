@@ -13,6 +13,7 @@ AnyAnyKiller helps AWS administrators identify overly permissive security group 
 - Supports flexible time periods (from minutes to days)
 - Provides recommendations on rule modifications
 - Handles CloudWatch Logs query limits with intelligent chunking
+- The ENI and SG don't need to be associated, they are only data sources
 
 ## Requirements
 
