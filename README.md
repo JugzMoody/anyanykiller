@@ -13,6 +13,7 @@ AnyAnyKiller helps AWS administrators identify overly permissive security group 
 - Supports flexible time periods (from minutes to days)
 - Provides recommendations on rule modifications
 - Handles CloudWatch Logs query limits with intelligent chunking
+- The ENI and SG don't need to be associated, they are only data sources
 
 ## Requirements
 
@@ -46,12 +47,9 @@ python anyanykiller.py --sg-id sg-12345678 --eni-id eni-12345678 --hours 24 --ve
 
 ## How It Works
 
-1. Retrieves the specified security group configuration
-2. Identifies any "any:any" rules (0.0.0.0/0 to 0.0.0.0/0)
-3. Finds network interfaces associated with the security group
-4. Retrieves VPC Flow Logs for those interfaces
-5. Analyzes actual traffic patterns
-6. Provides recommendations on rule modifications
+1. Retrieves VPC Flow Logs for the specified interface
+2. Identifies any inbound traffic that is only permitted via the any:any rule
+3. List traffic that would be blocked by removing any:any rule
 
 ## Time Period Handling
 
