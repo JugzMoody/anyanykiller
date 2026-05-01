@@ -720,6 +720,25 @@ class SecurityGroupAnalyzer:
                     if len(unique_return) > 10:
                         print(f"  ... and {len(unique_return) - 10} more unique combinations")
 
+                # Check for DNS-related return traffic without corresponding outbound DNS queries
+                # DNS queries are outbound UDP to port 53; if these appear as "return traffic"
+                # it means the inbound index matched them (likely VPC resolver responses)
+                dns_return_flows = [f for f in ob_return if f['protocol'] == 17 and f['dstport'] == 53]
+                dns_outbound_from_53 = [f for f in ob_return if f['protocol'] == 17 and f['srcport'] == 53]
+                if dns_return_flows or dns_outbound_from_53:
+                    # Check if there are any outbound UDP 53 flows in affected or still_allowed
+                    has_outbound_dns = any(
+                        f['protocol'] == 17 and f['dstport'] == 53
+                        for f in ob_affected + ob_still_allowed
+                    )
+                    if not has_outbound_dns:
+                        dns_count = len(dns_return_flows) + len(dns_outbound_from_53)
+                        print(f"\nℹ️  NOTE: {dns_count} DNS-related flows were classified as return traffic but no")
+                        print("   outbound DNS queries appear in the blocked/allowed results.")
+                        print("   This is normal when using the VPC DNS resolver (x.x.x.2) — queries to the")
+                        print("   VPC resolver may not appear in flow logs, but responses from upstream")
+                        print("   resolvers do. This tool can only analyze traffic visible in flow logs.")
+
                 if ob_affected:
                     unique_affected = self._deduplicate_flows(ob_affected)
 
