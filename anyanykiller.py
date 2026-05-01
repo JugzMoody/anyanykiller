@@ -396,9 +396,10 @@ class SecurityGroupAnalyzer:
     def is_outbound_return_traffic(self, flow, eni_ip, inbound_index=None):
         """Check if an outbound flow is return traffic for an inbound session.
 
-        Mirror of is_return_traffic but for the outbound direction. Checks whether
-        the ENI previously received inbound traffic that this outbound flow is
-        responding to (exact port-pair swap).
+        Mirror of is_return_traffic but for the outbound direction. Uses the same
+        conservative approach: only classifies as return traffic when there is an
+        exact port-pair match in the inbound index proving the ENI received an
+        inbound request that this outbound flow is responding to.
         """
         try:
             protocol = flow['protocol']
@@ -409,10 +410,10 @@ class SecurityGroupAnalyzer:
             if protocol == 1:
                 return False
 
-            # If source is a well-known server port, this is server->client response traffic
-            # (i.e., return traffic for an inbound request to a server port on this ENI)
-            if src_port in self._well_known_ports:
-                return True
+            # If destination is a well-known server port, the ENI is initiating a
+            # connection to a remote service — this is genuine outbound, not return traffic
+            if dst_port in self._well_known_ports:
+                return False
 
             # Look for a matching inbound flow with exact port-pair swap
             if inbound_index:
@@ -426,6 +427,8 @@ class SecurityGroupAnalyzer:
                 if other_flow['srcport'] == dst_port and other_flow['dstport'] == src_port:
                     return True
 
+            # No exact match — don't assume it's return traffic.
+            # Genuine outbound connections will be evaluated against outbound rules.
             return False
         except (ValueError, TypeError) as e:
             if self.verbose:
