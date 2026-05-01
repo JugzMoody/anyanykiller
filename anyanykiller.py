@@ -651,10 +651,10 @@ class SecurityGroupAnalyzer:
             if self.verbose and return_traffic_flows:
                 unique_return = self._deduplicate_flows(return_traffic_flows)
                 print(f"\nReturn traffic detected ({len(unique_return)} unique combinations, {len(return_traffic_flows)} total flows):")
-                print(f"  {'Source IP':<15} {'Protocol':<10} {'Dest Port':<10} {'Count':<8}")
-                print(f"  {'-' * 48}")
+                print(f"  {'Source IP':<15} {'Protocol':<10} {'Src Port':<10} {'Dest Port':<10} {'Count':<8}")
+                print(f"  {'-' * 58}")
                 for flow in unique_return[:10]:
-                    print(f"  {flow['srcaddr']:<15} {flow['protocol_name']:<10} {flow['dstport']:<10} {flow['count']:<8}")
+                    print(f"  {flow['srcaddr']:<15} {flow['protocol_name']:<10} {flow['srcport']:<10} {flow['dstport']:<10} {flow['count']:<8}")
                 if len(unique_return) > 10:
                     print(f"  ... and {len(unique_return) - 10} more unique combinations")
 
@@ -713,10 +713,10 @@ class SecurityGroupAnalyzer:
                 if self.verbose and ob_return:
                     unique_return = self._deduplicate_flows(ob_return)
                     print(f"\nOutbound return traffic detected ({len(unique_return)} unique combinations, {len(ob_return)} total flows):")
-                    print(f"  {'Dest IP':<15} {'Protocol':<10} {'Src Port':<10} {'Count':<8}")
-                    print(f"  {'-' * 48}")
+                    print(f"  {'Dest IP':<15} {'Protocol':<10} {'Src Port':<10} {'Dest Port':<10} {'Count':<8}")
+                    print(f"  {'-' * 58}")
                     for flow in unique_return[:10]:
-                        print(f"  {flow['dstaddr']:<15} {flow['protocol_name']:<10} {flow['srcport']:<10} {flow['count']:<8}")
+                        print(f"  {flow['dstaddr']:<15} {flow['protocol_name']:<10} {flow['srcport']:<10} {flow['dstport']:<10} {flow['count']:<8}")
                     if len(unique_return) > 10:
                         print(f"  ... and {len(unique_return) - 10} more unique combinations")
 
