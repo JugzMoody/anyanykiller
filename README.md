@@ -42,8 +42,9 @@ python anyanykiller.py --sg-id sg-12345678 --eni-id eni-12345678 --hours 24 --ve
 - `--sg-id`: Security Group ID to analyze
 - `--eni-id`: Network Interface ID to analyze
 - `--hours`: Time period to analyze (default: 24, supports float values for sub-hour periods)
-- `--verbose`: Enable detailed output
 - `--max-flows`: Maximum number of flow log entries to retrieve (default: 10000)
+- `--ephemeral-port-threshold`: Port number above which inbound traffic is considered ephemeral/return traffic (default: 32768). Tune this if your services run on non-standard high ports.
+- `--verbose`: Enable detailed output, including return traffic summary for validation
 
 ## How It Works
 
