@@ -200,7 +200,7 @@ class SecurityGroupAnalyzer:
 
                 chunk_infos.append((i, chunk_start, chunk_end))
 
-            print("Retrieving flow logs: ", end="", flush=True)
+            print("Retrieving flow logs:", flush=True)
 
             # Use parallel processing for chunks
             # Note: process_chunk only reads self.protocol_map and self.verbose (immutable during run).
@@ -219,7 +219,7 @@ class SecurityGroupAnalyzer:
                     completed += 1
                     progress = round((completed / num_chunks) * 100)
                     if not self.verbose and progress % 25 == 0:
-                        print(f"{progress}%", end=" ", flush=True)
+                        print(f"  {progress}%", end="", flush=True)
                     elif self.verbose:
                         chunk_info = future_to_chunk[future]
                         print(f"Completed chunk {chunk_info[0]+1}/{num_chunks}: {len(chunk_flows)} flows")
@@ -234,7 +234,7 @@ class SecurityGroupAnalyzer:
                         break
 
             if not self.verbose:
-                print("100% Complete")
+                print(" Complete")
 
             return all_flows
         except Exception as e:
@@ -326,14 +326,24 @@ class SecurityGroupAnalyzer:
                 print(f"Error checking traffic rule: {str(e)}")
             return False
 
-    def _build_flow_index(self, flows, eni_ip):
-        """Build an index of outbound flows for faster lookup, keyed by (dest_ip, protocol)"""
-        outbound_flows = defaultdict(list)
+    def _build_flow_index(self, flows, eni_ip, direction='outbound'):
+        """Build an index of flows for faster lookup, keyed by (remote_ip, protocol).
+
+        Args:
+            flows: List of flow log dicts.
+            eni_ip: The ENI's private IP address.
+            direction: 'outbound' indexes flows FROM eni_ip (for inbound return traffic detection).
+                       'inbound' indexes flows TO eni_ip (for outbound return traffic detection).
+        """
+        indexed_flows = defaultdict(list)
         for flow in flows:
-            if flow['srcaddr'] == eni_ip:
+            if direction == 'outbound' and flow['srcaddr'] == eni_ip:
                 key = (flow['dstaddr'], flow['protocol'])
-                outbound_flows[key].append(flow)
-        return outbound_flows
+                indexed_flows[key].append(flow)
+            elif direction == 'inbound' and flow['dstaddr'] == eni_ip:
+                key = (flow['srcaddr'], flow['protocol'])
+                indexed_flows[key].append(flow)
+        return indexed_flows
 
     def is_return_traffic(self, flow, flows, eni_ip, outbound_index=None):
         """Check if this flow is return traffic for an established session.
@@ -383,6 +393,107 @@ class SecurityGroupAnalyzer:
                 print(f"Error in return traffic detection: {str(e)}")
             return False
 
+    def is_outbound_return_traffic(self, flow, eni_ip, inbound_index=None):
+        """Check if an outbound flow is return traffic for an inbound session.
+
+        Mirror of is_return_traffic but for the outbound direction. Checks whether
+        the ENI previously received inbound traffic that this outbound flow is
+        responding to (exact port-pair swap).
+        """
+        try:
+            protocol = flow['protocol']
+            src_port = flow['srcport']
+            dst_port = flow['dstport']
+
+            # ICMP: don't treat as return traffic
+            if protocol == 1:
+                return False
+
+            # If source is a well-known server port, this is server->client response traffic
+            # (i.e., return traffic for an inbound request to a server port on this ENI)
+            if src_port in self._well_known_ports:
+                return True
+
+            # Look for a matching inbound flow with exact port-pair swap
+            if inbound_index:
+                key = (flow['dstaddr'], protocol)
+                matching_flows = inbound_index.get(key, [])
+            else:
+                matching_flows = []
+
+            for other_flow in matching_flows:
+                # Exact port-pair match: someone sent to src_port from dst_port, now ENI replies
+                if other_flow['srcport'] == dst_port and other_flow['dstport'] == src_port:
+                    return True
+
+            return False
+        except (ValueError, TypeError) as e:
+            if self.verbose:
+                print(f"Error in outbound return traffic detection: {str(e)}")
+            return False
+
+    def _analyze_outbound(self, flows, eni_ip, outbound_rules, max_flows):
+        """Analyze outbound traffic against any:any outbound rules.
+
+        Returns a dict with keys: affected, still_allowed, return_traffic, total_outbound
+        """
+        any_any_outbound = [rule for rule in outbound_rules if self.is_any_any_rule(rule)]
+        other_outbound = [rule for rule in outbound_rules if not self.is_any_any_rule(rule)]
+
+        if not any_any_outbound:
+            return None
+
+        # Build inbound flow index for outbound return traffic detection
+        inbound_index = self._build_flow_index(flows, eni_ip, direction='inbound')
+
+        affected_flows = []
+        still_allowed_flows = []
+        return_traffic_flows = []
+        outbound_count = 0
+        processed = 0
+
+        for flow in flows:
+            if flow['action'] != 'ACCEPT' or flow['srcaddr'] != eni_ip:
+                continue
+
+            outbound_count += 1
+            processed += 1
+
+            if processed > max_flows:
+                if self.verbose:
+                    print(f"Outbound early termination: processed {processed} flows")
+                break
+
+            # Skip return traffic — stateful SGs allow replies automatically
+            if self.is_outbound_return_traffic(flow, eni_ip, inbound_index):
+                return_traffic_flows.append(flow)
+                continue
+
+            # Check if flow is allowed by outbound any:any rule
+            allowed_by_any_any = any(
+                self.traffic_allowed_by_rule(flow, rule, is_inbound=False)
+                for rule in any_any_outbound
+            )
+
+            if allowed_by_any_any:
+                allowed_by_other = any(
+                    self.traffic_allowed_by_rule(flow, rule, is_inbound=False)
+                    for rule in other_outbound
+                )
+
+                if allowed_by_other:
+                    still_allowed_flows.append(flow)
+                else:
+                    affected_flows.append(flow)
+
+        return {
+            'affected': affected_flows,
+            'still_allowed': still_allowed_flows,
+            'return_traffic': return_traffic_flows,
+            'total_outbound': outbound_count,
+            'any_any_rules': any_any_outbound,
+        }
+
     def _deduplicate_flows(self, flows):
         """Deduplicate flows by (srcaddr, protocol_name, dstport) and attach counts.
 
@@ -408,7 +519,7 @@ class SecurityGroupAnalyzer:
         unique_flows.sort(key=lambda x: x['count'], reverse=True)
         return unique_flows
 
-    def analyze_security_group(self, sg_id, eni_id, hours=24.0, max_flows=10000):
+    def analyze_security_group(self, sg_id, eni_id, hours=24.0, max_flows=10000, analyze_outbound=False):
         """Main analysis function"""
         print(f"Analyzing Security Group: {sg_id}")
         print(f"Network Interface: {eni_id}")
@@ -419,6 +530,7 @@ class SecurityGroupAnalyzer:
             print(f"Flow logs period: {hours} hours")
         print(f"Max flows to analyze: {max_flows}")
         print(f"Ephemeral port threshold: {self.ephemeral_port_threshold}")
+        print(f"Analyze outbound: {'Yes' if analyze_outbound else 'No'}")
         print("-" * 50)
 
         # Get security group
@@ -478,98 +590,163 @@ class SecurityGroupAnalyzer:
         any_any_inbound = [rule for rule in inbound_rules if self.is_any_any_rule(rule)]
         other_inbound = [rule for rule in inbound_rules if not self.is_any_any_rule(rule)]
 
-        if not any_any_inbound:
+        has_inbound_any_any = bool(any_any_inbound)
+
+        if not has_inbound_any_any and not analyze_outbound:
             print("\nNo inbound any:any rules found in this security group")
             return
 
-        # Build outbound flow index for return traffic detection
-        outbound_index = self._build_flow_index(flows, eni_ip)
+        # Build outbound flow index for inbound return traffic detection
+        outbound_index = self._build_flow_index(flows, eni_ip, direction='outbound')
 
-        # Analyze traffic that would be affected
-        affected_flows = []
-        still_allowed_flows = []
-        return_traffic_flows = []
-        inbound_flows = 0
-        processed_flows = 0
+        # ── Inbound Analysis ──
+        if has_inbound_any_any:
+            print(f"\n{'=' * 50}")
+            print("INBOUND ANALYSIS")
+            print(f"{'=' * 50}")
 
-        for flow in flows:
-            if flow['action'] != 'ACCEPT' or flow['dstaddr'] != eni_ip:
-                continue
+            affected_flows = []
+            still_allowed_flows = []
+            return_traffic_flows = []
+            inbound_flows = 0
+            processed_flows = 0
 
-            inbound_flows += 1
-            processed_flows += 1
+            for flow in flows:
+                if flow['action'] != 'ACCEPT' or flow['dstaddr'] != eni_ip:
+                    continue
 
-            if processed_flows > max_flows:
-                if self.verbose:
-                    print(f"Early termination: processed {processed_flows} flows")
-                break
+                inbound_flows += 1
+                processed_flows += 1
 
-            # Skip return traffic as it's automatically allowed by stateful security groups
-            if self.is_return_traffic(flow, flows, eni_ip, outbound_index):
-                return_traffic_flows.append(flow)
-                continue
+                if processed_flows > max_flows:
+                    if self.verbose:
+                        print(f"Early termination: processed {processed_flows} flows")
+                    break
 
-            # Check if inbound flow is currently allowed by inbound any:any rule
-            allowed_by_any_any = any(
-                self.traffic_allowed_by_rule(flow, rule, is_inbound=True)
-                for rule in any_any_inbound
-            )
+                if self.is_return_traffic(flow, flows, eni_ip, outbound_index):
+                    return_traffic_flows.append(flow)
+                    continue
 
-            if allowed_by_any_any:
-                allowed_by_other = any(
+                allowed_by_any_any = any(
                     self.traffic_allowed_by_rule(flow, rule, is_inbound=True)
-                    for rule in other_inbound
+                    for rule in any_any_inbound
                 )
 
-                if allowed_by_other:
-                    still_allowed_flows.append(flow)
-                else:
-                    affected_flows.append(flow)
+                if allowed_by_any_any:
+                    allowed_by_other = any(
+                        self.traffic_allowed_by_rule(flow, rule, is_inbound=True)
+                        for rule in other_inbound
+                    )
 
-        print(f"\nInbound flows: {inbound_flows} (including {len(return_traffic_flows)} return traffic flows that were excluded)")
+                    if allowed_by_other:
+                        still_allowed_flows.append(flow)
+                    else:
+                        affected_flows.append(flow)
 
-        # Show return traffic summary in verbose mode so users can validate
-        if self.verbose and return_traffic_flows:
-            unique_return = self._deduplicate_flows(return_traffic_flows)
-            print(f"\nReturn traffic detected ({len(unique_return)} unique combinations, {len(return_traffic_flows)} total flows):")
-            print(f"  {'Source IP':<15} {'Protocol':<10} {'Dest Port':<10} {'Count':<8}")
-            print(f"  {'-' * 48}")
-            for flow in unique_return[:10]:
-                print(f"  {flow['srcaddr']:<15} {flow['protocol_name']:<10} {flow['dstport']:<10} {flow['count']:<8}")
-            if len(unique_return) > 10:
-                print(f"  ... and {len(unique_return) - 10} more unique combinations")
+            print(f"\nInbound flows: {inbound_flows} (including {len(return_traffic_flows)} return traffic flows that were excluded)")
 
-        if affected_flows:
-            unique_affected = self._deduplicate_flows(affected_flows)
+            if self.verbose and return_traffic_flows:
+                unique_return = self._deduplicate_flows(return_traffic_flows)
+                print(f"\nReturn traffic detected ({len(unique_return)} unique combinations, {len(return_traffic_flows)} total flows):")
+                print(f"  {'Source IP':<15} {'Protocol':<10} {'Dest Port':<10} {'Count':<8}")
+                print(f"  {'-' * 48}")
+                for flow in unique_return[:10]:
+                    print(f"  {flow['srcaddr']:<15} {flow['protocol_name']:<10} {flow['dstport']:<10} {flow['count']:<8}")
+                if len(unique_return) > 10:
+                    print(f"  ... and {len(unique_return) - 10} more unique combinations")
 
-            print(f"\nInbound traffic that would be BLOCKED after removing inbound any:any rules:")
-            print(f"{'Source IP':<15} {'Protocol':<10} {'Dest Port':<10} {'Count':<8}")
-            print("-" * 50)
-            for flow in unique_affected[:20]:
-                print(f"{flow['srcaddr']:<15} {flow['protocol_name']:<10} {flow['dstport']:<10} {flow['count']:<8}")
+            if affected_flows:
+                unique_affected = self._deduplicate_flows(affected_flows)
 
-            if len(unique_affected) > 20:
-                print(f"... and {len(unique_affected) - 20} more unique flows")
-            total_count = sum(flow['count'] for flow in unique_affected)
-            print(f"(Total {total_count} flows across {len(unique_affected)} unique combinations)")
+                print(f"\nInbound traffic that would be BLOCKED after removing inbound any:any rules:")
+                print(f"{'Source IP':<15} {'Protocol':<10} {'Dest Port':<10} {'Count':<8}")
+                print("-" * 50)
+                for flow in unique_affected[:20]:
+                    print(f"{flow['srcaddr']:<15} {flow['protocol_name']:<10} {flow['dstport']:<10} {flow['count']:<8}")
 
-        if still_allowed_flows:
-            unique_allowed = self._deduplicate_flows(still_allowed_flows)
-            print(f"\n{len(unique_allowed)} unique traffic flows would still be allowed by other inbound rules")
-            if len(still_allowed_flows) != len(unique_allowed):
-                print(f"(Total {len(still_allowed_flows)} individual flows)")
+                if len(unique_affected) > 20:
+                    print(f"... and {len(unique_affected) - 20} more unique flows")
+                total_count = sum(flow['count'] for flow in unique_affected)
+                print(f"(Total {total_count} flows across {len(unique_affected)} unique combinations)")
 
-        # Recommendation
-        if not affected_flows:
-            print(f"\n✅ RECOMMENDATION: Safe to remove inbound any:any rules")
             if still_allowed_flows:
-                print("All current inbound traffic would still be allowed by other rules")
+                unique_allowed = self._deduplicate_flows(still_allowed_flows)
+                print(f"\n{len(unique_allowed)} unique traffic flows would still be allowed by other inbound rules")
+                if len(still_allowed_flows) != len(unique_allowed):
+                    print(f"(Total {len(still_allowed_flows)} individual flows)")
+
+            if not affected_flows:
+                print(f"\n✅ INBOUND RECOMMENDATION: Safe to remove inbound any:any rules")
+                if still_allowed_flows:
+                    print("All current inbound traffic would still be allowed by other rules")
+                else:
+                    print("No new inbound connections found - all traffic appears to be return/outbound traffic")
             else:
-                print("No new inbound connections found - all traffic appears to be return/outbound traffic")
+                print(f"\n⚠️  INBOUND RECOMMENDATION: Review before removing inbound any:any rules")
+                print(f"{len(affected_flows)} inbound traffic flows would be blocked")
+                print("Consider adding specific inbound rules for the affected traffic first")
         else:
-            print(f"\n⚠️  RECOMMENDATION: Review before removing inbound any:any rules")
-            print(f"{len(affected_flows)} inbound traffic flows would be blocked")
-            print("Consider adding specific inbound rules for the affected traffic first")
+            print("\nNo inbound any:any rules found in this security group")
+
+        # ── Outbound Analysis ──
+        if analyze_outbound:
+            print(f"\n{'=' * 50}")
+            print("OUTBOUND ANALYSIS")
+            print(f"{'=' * 50}")
+
+            outbound_rules = sg.get('IpPermissionsEgress', [])
+            result = self._analyze_outbound(flows, eni_ip, outbound_rules, max_flows)
+
+            if result is None:
+                print("\nNo outbound any:any rules found in this security group")
+            else:
+                ob_affected = result['affected']
+                ob_still_allowed = result['still_allowed']
+                ob_return = result['return_traffic']
+                ob_total = result['total_outbound']
+
+                print(f"\nOutbound flows: {ob_total} (including {len(ob_return)} return traffic flows that were excluded)")
+
+                if self.verbose and ob_return:
+                    unique_return = self._deduplicate_flows(ob_return)
+                    print(f"\nOutbound return traffic detected ({len(unique_return)} unique combinations, {len(ob_return)} total flows):")
+                    print(f"  {'Dest IP':<15} {'Protocol':<10} {'Src Port':<10} {'Count':<8}")
+                    print(f"  {'-' * 48}")
+                    for flow in unique_return[:10]:
+                        print(f"  {flow['dstaddr']:<15} {flow['protocol_name']:<10} {flow['srcport']:<10} {flow['count']:<8}")
+                    if len(unique_return) > 10:
+                        print(f"  ... and {len(unique_return) - 10} more unique combinations")
+
+                if ob_affected:
+                    unique_affected = self._deduplicate_flows(ob_affected)
+
+                    print(f"\nOutbound traffic that would be BLOCKED after removing outbound any:any rules:")
+                    print(f"{'Dest IP':<15} {'Protocol':<10} {'Dest Port':<10} {'Count':<8}")
+                    print("-" * 50)
+                    for flow in unique_affected[:20]:
+                        print(f"{flow['dstaddr']:<15} {flow['protocol_name']:<10} {flow['dstport']:<10} {flow['count']:<8}")
+
+                    if len(unique_affected) > 20:
+                        print(f"... and {len(unique_affected) - 20} more unique flows")
+                    total_count = sum(flow['count'] for flow in unique_affected)
+                    print(f"(Total {total_count} flows across {len(unique_affected)} unique combinations)")
+
+                if ob_still_allowed:
+                    unique_allowed = self._deduplicate_flows(ob_still_allowed)
+                    print(f"\n{len(unique_allowed)} unique traffic flows would still be allowed by other outbound rules")
+                    if len(ob_still_allowed) != len(unique_allowed):
+                        print(f"(Total {len(ob_still_allowed)} individual flows)")
+
+                if not ob_affected:
+                    print(f"\n✅ OUTBOUND RECOMMENDATION: Safe to remove outbound any:any rules")
+                    if ob_still_allowed:
+                        print("All current outbound traffic would still be allowed by other rules")
+                    else:
+                        print("No outbound connections found that depend solely on the any:any rule")
+                else:
+                    print(f"\n⚠️  OUTBOUND RECOMMENDATION: Review before removing outbound any:any rules")
+                    print(f"{len(ob_affected)} outbound traffic flows would be blocked")
+                    print("Consider adding specific outbound rules for the affected traffic first")
 
 
 def main():
@@ -582,6 +759,8 @@ def main():
                         help='Maximum number of flow logs to analyze (default: 10000)')
     parser.add_argument('--ephemeral-port-threshold', type=int, default=DEFAULT_EPHEMERAL_PORT_THRESHOLD,
                         help=f'Port threshold for ephemeral/return traffic detection (default: {DEFAULT_EPHEMERAL_PORT_THRESHOLD})')
+    parser.add_argument('--analyze-outbound', action='store_true',
+                        help='Also analyze outbound any:any rules (not run by default)')
     parser.add_argument('--verbose', action='store_true', help='Enable verbose output')
 
     args = parser.parse_args()
@@ -590,7 +769,10 @@ def main():
         verbose=args.verbose,
         ephemeral_port_threshold=args.ephemeral_port_threshold
     )
-    analyzer.analyze_security_group(args.sg_id, args.eni_id, args.hours, args.max_flows)
+    analyzer.analyze_security_group(
+        args.sg_id, args.eni_id, args.hours, args.max_flows,
+        analyze_outbound=args.analyze_outbound
+    )
 
 
 if __name__ == "__main__":

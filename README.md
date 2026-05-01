@@ -37,6 +37,16 @@ pip install boto3
 python anyanykiller.py --sg-id sg-12345678 --eni-id eni-12345678 --hours 24 --verbose
 ```
 
+### Outbound Analysis
+
+To also analyze outbound any:any rules, add the `--analyze-outbound` flag:
+
+```bash
+python anyanykiller.py --sg-id sg-12345678 --eni-id eni-12345678 --analyze-outbound
+```
+
+This is opt-in because most security groups have a default outbound any:any rule, and the output can be verbose.
+
 ### Parameters
 
 - `--sg-id`: Security Group ID to analyze
@@ -44,13 +54,15 @@ python anyanykiller.py --sg-id sg-12345678 --eni-id eni-12345678 --hours 24 --ve
 - `--hours`: Time period to analyze (default: 24, supports float values for sub-hour periods)
 - `--max-flows`: Maximum number of flow log entries to retrieve (default: 10000)
 - `--ephemeral-port-threshold`: Port number above which inbound traffic is considered ephemeral/return traffic (default: 32768). Tune this if your services run on non-standard high ports.
+- `--analyze-outbound`: Also analyze outbound any:any rules (off by default)
 - `--verbose`: Enable detailed output, including return traffic summary for validation
 
 ## How It Works
 
 1. Retrieves VPC Flow Logs for the specified interface
 2. Identifies any inbound traffic that is only permitted via the any:any rule
-3. List traffic that would be blocked by removing any:any rule
+3. Lists traffic that would be blocked by removing the any:any rule
+4. Optionally (`--analyze-outbound`) performs the same analysis for outbound rules
 
 ## Time Period Handling
 
